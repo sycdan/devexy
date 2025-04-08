@@ -7,7 +7,8 @@ from rich.live import Live
 from rich.table import Table
 
 from devexy import settings
-from devexy.exceptions import ExecutableError, ToolError
+from devexy.exceptions import ToolError
+from devexy.settings import KUSTOMIZE_OVERLAY_DIR
 from devexy.tools.kubectl import kubectl
 from devexy.tools.kustomize import kustomize
 from devexy.tools.minikube import minikube
@@ -117,7 +118,7 @@ def inspect(
   if not kustomize_path.is_dir():
     fail(f"Invalid Kustomize root directory: {kustomize_root}")
 
-  overlay_path = kustomize_path / "overlays" / overlay
+  overlay_path = KUSTOMIZE_OVERLAY_DIR
   if not overlay_path.is_dir():
     fail(f"Invalid Overlay directory: {overlay_path}")
   if settings.NOISY:
@@ -145,7 +146,7 @@ def ensure_namespaces(docs: list[dict]):
   namespaces = set()
 
   for doc in docs:
-    namespace = k8s.get_namespace(doc)
+    namespace = k8s.get_namespace(doc, default=None)
     if namespace:
       namespaces.add(namespace)
 
@@ -162,54 +163,89 @@ def apply_cluster_config(
   overlay_path: Path,
 ):
   """Builds cluster config via Kustomize and applies via kubectl.
-  Replicas will be set to 0 for new Deployments and StatefulSets during application.
+  Scalable resources will be set to 0 replicas when deployed for the first time.
+  Unchanged resources will not be re-deployed.
   """
   docs = []
+  processed_count = 0
+  applied_count = 0
+  skipped_count = 0
+  overall_success = True
 
   try:
     with begin("Loading cluster configuration"):
       # Resources will be grouped intelligently according to dependencies
       yaml_output = kustomize.build(overlay_path)
-      # Load and filter documents, keeping only dictionaries
       all_docs = yaml.safe_load_all(yaml_output)
-      docs = [doc for doc in all_docs if isinstance(doc, dict)]
+      # Filter out None entries which can result from comments or empty docs
+      docs = [doc for doc in all_docs if doc is not None and isinstance(doc, dict)]
       ok(f"{len(docs)} documents found")
   except ToolError as e:
     fail(f"{e}\n{e.stderr or ''}")
+    return
   except yaml.YAMLError as e:
     fail(f"Error parsing YAML: {e}")
+    return
 
   ensure_namespaces(docs)
 
   with begin("Applying configuration"):
     for doc in docs:
-      kind = k8s.get_kind(doc)
-      name = k8s.get_name(doc)
-      namespace = k8s.get_namespace(doc)
-      resource_id = f"{namespace}:{kind}:{name}"
+      processed_count += 1
 
-      # Set replicas to 0 for new scalable resources, preserving existing counts
-      if k8s.is_scalable(kind):
-        existing_replicas = kubectl.get_replicas(name, kind, namespace)
-        if existing_replicas is None:
-          doc["spec"]["replicas"] = 0
-        else:
-          doc["spec"]["replicas"] = existing_replicas
+      key_fields = k8s.get_key_fields(doc)
+      resource_key = k8s.get_resource_key(doc)
+      if not resource_key:
+        skipped_count += 1
+        continue
 
-      # Apply the individual document to the cluster
-      try:
-        doc_yaml = k8s.dict_to_yaml(doc)
-        kubectl.apply(doc_yaml)
+      if k8s.is_scalable(doc):
+        try:
+          if "spec" not in doc:
+            doc["spec"] = {}
 
-      except ExecutableError:
-        fail("Error: 'kubectl' command not found. Is it installed and in PATH?")
-      except ToolError as e:
-        fail(
-          f"Error applying {resource_id}: {e}\nstdout:\n{e.stdout}\nstderr:\n{e.stderr}"
-        )
-      except Exception as e:
-        fail(
-          f"An unexpected error occurred during kubectl apply for {resource_id}: {e}"
-        )
+          # Set replicas to 0 for new scalable resources, preserving existing counts
+          existing_replicas = kubectl.get_replicas(**key_fields)
+          if existing_replicas is None:
+            doc["spec"]["replicas"] = 0
+          else:  # Resource exists, preserve its current replica count
+            doc["spec"]["replicas"] = existing_replicas
+        except Exception as e:
+          # Decide if this should mark overall_success as False. Let's say yes for now.
+          overall_success = False
 
-    ok()
+      should_apply, current_hash = k8s.check_cache(resource_key, doc)
+
+      if current_hash is None:
+        overall_success = False
+        continue
+
+      if should_apply:
+        # Apply the potentially modified document
+        try:
+          doc_yaml = k8s.dict_to_yaml(doc)
+          apply_successful = kubectl.apply(doc_yaml)
+
+          if apply_successful:
+            k8s.update_cache(resource_key, current_hash)
+            applied_count += 1
+          else:
+            print(f"[red]Error applying {resource_key} (kubectl.apply failed)[/red]")
+            overall_success = False
+
+        except Exception as e:
+          # Catch other unexpected errors during apply/cache update
+          print(
+            f"[red]An unexpected error occurred during apply/cache update for {resource_key}: {e}[/red]"
+          )
+          overall_success = False
+      else:  # Resource hasn't changed according to cache
+        skipped_count += 1
+
+    summary = (
+      f"{processed_count} processed, {applied_count} applied, {skipped_count} skipped"
+    )
+    if overall_success:
+      ok(summary)
+    else:
+      fail(f"{summary} (Encountered errors during apply)")

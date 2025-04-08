@@ -1,5 +1,6 @@
 from devexy.bases.tool import Tool
 from devexy.exceptions import ToolError
+from devexy.utils import k8s
 
 
 class Kubectl(Tool):
@@ -31,13 +32,18 @@ class Kubectl(Tool):
       else:
         raise RuntimeError(f"Error creating {namespace}: {e.stderr}") from e
 
-  def resource_exists(self, kind: str, name: str, namespace: str = "default") -> bool:
+  def resource_exists(
+    self,
+    resource_kind: str,
+    resource_name: str,
+    namespace: str = "default",
+  ) -> bool:
     try:
       # Use '-o name' for a lightweight check that doesn't fetch the full resource
       args = [
         "get",
-        kind.lower(),
-        name,
+        resource_kind.lower(),
+        resource_name,
         "-o",
         "name",
       ]
@@ -50,21 +56,21 @@ class Kubectl(Tool):
         return False
       else:
         raise RuntimeError(
-          f"Error checking resource {namespace}/{kind}/{name}: {e.stderr}"
+          f"Error checking resource {namespace}/{resource_kind}/{resource_name}: {e.stderr}"
         ) from e
 
   def get_replicas(
     self,
-    resource_name: str,
     resource_kind: str,
-    namespace: str,
+    resource_name: str,
+    namespace: str = "default",
   ) -> int | None:
     try:
       # Using jsonpath directly might fail if the resource doesn't exist or lacks the field.
       # A simple 'get' first might be safer, but this is more direct.
       output = self.exec(
         "get",
-        resource_kind.lower(),
+        resource_kind,
         resource_name,
         "-n",
         namespace,
