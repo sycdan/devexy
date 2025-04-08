@@ -1,0 +1,5 @@
+APP_NAME = "Devexy"
+APP_VERSION = "2025.4.10"
+
+CHECK_MARK = "\u2713"
+CROSS_MARK = "\u2717"
