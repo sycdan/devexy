@@ -1,0 +1,6 @@
+castaway~=1.1.0
+kubernetes~=32.0
+blessed
+pyyaml~=6.0
+rich~=14.0
+typer~=0.15
